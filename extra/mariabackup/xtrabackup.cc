@@ -2542,6 +2542,7 @@ xtrabackup_copy_logfile(lsn_t from_lsn, my_bool is_last)
 	lsn_t		contiguous_lsn;
 
 	ut_a(dst_log_file != NULL);
+	ut_ad(recv_sys != NULL);
 
 	/* read from checkpoint_lsn_start to current */
 	contiguous_lsn = ut_uint64_align_down(from_lsn, OS_FILE_LOG_BLOCK_SIZE);
@@ -3877,6 +3878,7 @@ xtrabackup_backup_func(void)
 
 	ut_crc32_init();
 	crc_init();
+	recv_sys_init();
 
 #ifdef WITH_INNODB_DISALLOW_WRITES
 	srv_allow_writes_event = os_event_create(0);
@@ -5682,6 +5684,7 @@ skip_check:
 	srv_page_size = (1 << srv_page_size_shift);
 	sync_check_init();
 	ut_crc32_init();
+	recv_sys_init();
 
 #ifdef WITH_INNODB_DISALLOW_WRITES
 	srv_allow_writes_event = os_event_create(0);
@@ -5732,12 +5735,10 @@ error:
 
 		xb_filter_hash_free(inc_dir_tables_hash);
 	}
-	if (fil_system) {
-		fil_close();
-	}
-
+	fil_close();
 	innodb_free_param();
 	sync_check_close();
+	recv_sys_close();
 
 	/* Reset the configuration as it might have been changed by
 	xb_data_files_init(). */
@@ -6035,8 +6036,10 @@ next_node:
         innodb_free_param();
 
 	sync_check_close();
+	recv_sys_close();
 
 	/* re-init necessary components */
+	recv_sys_init();
 	sync_check_init();
 
 	if (xtrabackup_close_temp_log())
@@ -6079,9 +6082,8 @@ next_node:
 	}
 
 	sync_check_close();
-	if (fil_system) {
-		fil_close();
-	}
+	recv_sys_close();
+	fil_close();
 
 	srv_force_recovery = save_force_recovery;
 
