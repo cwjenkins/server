@@ -162,11 +162,12 @@ buf_dblwr_init(
 		ut_zalloc_nokey(buf_size * sizeof(void*)));
 }
 
-/****************************************************************//**
-Creates the doublewrite buffer to a new InnoDB installation. The header of the
-doublewrite buffer is placed on the trx system header page.
-@return true if successful, false if not. */
-MY_ATTRIBUTE((warn_unused_result))
+/** Create the doublewrite buffer if the doublewrite buffer header
+is not present in the TRX_SYS page.
+@return	whether the operation succeeded
+@retval	true	if the doublewrite buffer exists or was created
+@retval	false	if the creation failed (too small first data file) */
+UNIV_INTERN
 bool
 buf_dblwr_create()
 {
@@ -181,12 +182,11 @@ buf_dblwr_create()
 
 	if (buf_dblwr) {
 		/* Already inited */
-
 		return(true);
 	}
 
 start_again:
-	mtr_start(&mtr);
+	mtr.start();
 	buf_dblwr_being_created = TRUE;
 
 	doublewrite = buf_dblwr_get(&mtr);
@@ -198,32 +198,49 @@ start_again:
 
 		buf_dblwr_init(doublewrite);
 
-		mtr_commit(&mtr);
+		mtr.commit();
 		buf_dblwr_being_created = FALSE;
 		return(true);
 	}
 
 	ib::info() << "Doublewrite buffer not found: creating new";
+	{
+		fil_space_t* space = fil_space_acquire(TRX_SYS_SPACE);
+		const bool fail = UT_LIST_GET_FIRST(space->chain)->size
+			< 3 * FSP_EXTENT_SIZE;
+		fil_space_release(space);
+
+		if (fail) {
+			goto too_small;
+		}
+	}
 
 	block2 = fseg_create(TRX_SYS_SPACE, TRX_SYS_PAGE_NO,
 			     TRX_SYS_DOUBLEWRITE
 			     + TRX_SYS_DOUBLEWRITE_FSEG, &mtr);
 
-	/* fseg_create acquires a second latch on the page,
-	therefore we must declare it: */
-
-	buf_block_dbg_add_level(block2, SYNC_NO_ORDER_CHECK);
-
 	if (block2 == NULL) {
-		ib::error() << "Cannot create doublewrite buffer: you must"
-			" increase your tablespace size."
-			" Cannot continue operation.";
-
+too_small:
+		ib::error() <<
+			"Cannot create doublewrite buffer: "
+			"the first file in innodb_data_file_path"
+			" is too small.";
 		/* The mini-transaction did not write anything yet;
 		we merely failed to allocate a page. */
 		mtr.commit();
 		return(false);
 	}
+
+	/* FIXME: After this point, the doublewrite buffer creation
+	is not atomic. The doublewrite buffer should not exist in
+	the InnoDB system tablespace file in the first place.
+	It could be located in separate optional file(s) in a
+	user-specified location. */
+
+	/* fseg_create acquires a second latch on the page,
+	therefore we must declare it: */
+
+	buf_block_dbg_add_level(block2, SYNC_NO_ORDER_CHECK);
 
 	fseg_header = doublewrite + TRX_SYS_DOUBLEWRITE_FSEG;
 	prev_page_no = 0;
@@ -515,6 +532,10 @@ buf_dblwr_process()
 	byte*		read_buf;
 	byte*		unaligned_read_buf;
 	recv_dblwr_t&	recv_dblwr	= recv_sys->dblwr;
+
+	if (!buf_dblwr) {
+		return;
+	}
 
 	unaligned_read_buf = static_cast<byte*>(
 		ut_malloc_nokey(2 * UNIV_PAGE_SIZE));
