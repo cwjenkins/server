@@ -12952,7 +12952,7 @@ index_bad:
 		    	0);
 
 	if (m_form->s->table_type == TABLE_TYPE_SEQUENCE) {
-		m_flags |= 1U << DICT_TF_POS_NO_ROLLBACK;
+		m_flags |= DICT_TF_MASK_NO_ROLLBACK;
 	}
 
 	/* Set the flags2 when create table or alter tables */
