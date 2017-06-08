@@ -70,7 +70,7 @@ is set to TRUE by the page_cleaner thread when it is spawned and is set
 back to FALSE at shutdown by the page_cleaner as well. Therefore no
 need to protect it by a mutex. It is only ever read by the thread
 doing the shutdown */
-bool buf_page_cleaner_is_active = false;
+bool buf_page_cleaner_is_active;
 
 /** Factor for scan length to determine n_pages for intended oldest LSN
 progress */
@@ -3159,8 +3159,6 @@ DECLARE_THREAD(buf_flush_page_cleaner_coordinator)(
 		" See the man page of setpriority().";
 	}
 #endif /* UNIV_LINUX */
-
-	buf_page_cleaner_is_active = true;
 
 	while (!srv_read_only_mode
 	       && srv_shutdown_state == SRV_SHUTDOWN_NONE

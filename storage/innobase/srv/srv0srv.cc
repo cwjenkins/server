@@ -195,9 +195,6 @@ my_bool	srv_use_mtflush;
 my_bool	srv_master_thread_disabled_debug;
 /** Event used to inform that master thread is disabled. */
 static os_event_t	srv_master_thread_disabled_event;
-/** Debug variable to find if any background threads are adding
-to purge during slow shutdown. */
-extern bool		trx_commit_disallowed;
 #endif /* UNIV_DEBUG */
 
 /*------------------------- LOG FILES ------------------------ */
@@ -2558,29 +2555,37 @@ suspend_thread:
 	goto loop;
 }
 
-/**
-Check if purge should stop.
-@return true if it should shutdown. */
+/** Check if purge should stop.
+@param[in]	n_purged	pages purged in the last batch
+@return whether purge should exit */
 static
 bool
-srv_purge_should_exit(
-	MYSQL_THD	thd,
-	ulint		n_purged)	/*!< in: pages purged in last batch */
+srv_purge_should_exit(ulint n_purged)
 {
 	switch (srv_shutdown_state) {
 	case SRV_SHUTDOWN_NONE:
-		if ((!srv_was_started || srv_running)
-		    && !thd_kill_level(thd)) {
+		if (!srv_was_started || srv_running) {
 			/* Normal operation. */
 			break;
 		}
 		/* close_connections() was called */
 		/* fall through */
 	case SRV_SHUTDOWN_CLEANUP:
-	case SRV_SHUTDOWN_EXIT_THREADS:
-		/* Exit unless slow shutdown requested or all done. */
-		return(srv_fast_shutdown != 0 || n_purged == 0);
+		if (srv_undo_sources) {
+			break;
+		}
+		if (srv_fast_shutdown) {
+			return(true);
+		}
+		/* Slow shutdown was requested. */
+		if (n_purged) {
+			/* The previous round still did some work. */
+			break;
+		}
+		/* Exit if there are no active transactions to roll back. */
+		return(trx_sys_any_active_transactions() == 0);
 
+	case SRV_SHUTDOWN_EXIT_THREADS:
 	case SRV_SHUTDOWN_LAST_PHASE:
 	case SRV_SHUTDOWN_FLUSH_PHASE:
 		ut_error;
@@ -2706,7 +2711,6 @@ static
 ulint
 srv_do_purge(
 /*=========*/
-	MYSQL_THD	thd,
 	ulint		n_threads,	/*!< in: number of threads to use */
 	ulint*		n_total_purged)	/*!< in/out: total pages purged */
 {
@@ -2777,7 +2781,7 @@ srv_do_purge(
 
 		*n_total_purged += n_pages_purged;
 
-	} while (!srv_purge_should_exit(thd, n_pages_purged)
+	} while (!srv_purge_should_exit(n_pages_purged)
 		 && n_pages_purged > 0
 		 && purge_sys->state == PURGE_STATE_RUN);
 
@@ -2790,7 +2794,6 @@ static
 void
 srv_purge_coordinator_suspend(
 /*==========================*/
-	MYSQL_THD	thd,
 	srv_slot_t*	slot,			/*!< in/out: Purge coordinator
 						thread slot */
 	ulint		rseg_history_len)	/*!< in: history list length
@@ -2852,7 +2855,7 @@ srv_purge_coordinator_suspend(
 		}
 
 		rw_lock_x_unlock(&purge_sys->latch);
-	} while (stop && !thd_kill_level(thd));
+	} while (stop && srv_undo_sources);
 
 	srv_resume_thread(slot, 0, false);
 }
@@ -2902,51 +2905,25 @@ DECLARE_THREAD(srv_purge_coordinator_thread)(
 		purge didn't purge any records then wait for activity. */
 
 		if (srv_shutdown_state == SRV_SHUTDOWN_NONE
-		    && !thd_kill_level(thd)
+		    && srv_undo_sources
 		    && (purge_sys->state == PURGE_STATE_STOP
 			|| n_total_purged == 0)) {
 
-			srv_purge_coordinator_suspend(thd, slot, rseg_history_len);
+			srv_purge_coordinator_suspend(slot, rseg_history_len);
 		}
 
 		ut_ad(!slot->suspended);
 
-		if (srv_purge_should_exit(thd, n_total_purged)) {
+		if (srv_purge_should_exit(n_total_purged)) {
 			break;
 		}
 
 		n_total_purged = 0;
 
 		rseg_history_len = srv_do_purge(
-			thd, srv_n_purge_threads, &n_total_purged);
+			srv_n_purge_threads, &n_total_purged);
 
-	} while (!srv_purge_should_exit(thd, n_total_purged));
-
-	/* Ensure that we don't jump out of the loop unless the
-	exit condition is satisfied. */
-
-	ut_a(srv_purge_should_exit(thd, n_total_purged));
-
-	/* Ensure that all records are purged on slow shutdown. */
-	while (srv_fast_shutdown == 0
-	       && trx_purge(1, srv_purge_batch_size, false));
-
-#ifdef UNIV_DEBUG
-	if (srv_fast_shutdown == 0) {
-		trx_commit_disallowed = true;
-	}
-#endif /* UNIV_DEBUG */
-
-	/* This trx_purge is called to remove any undo records (added by
-	background threads) after completion of the above loop. When
-	srv_fast_shutdown != 0, a large batch size can cause significant
-	delay in shutdown ,so reducing the batch size to magic number 20
-	(which was default in 5.5), which we hope will be sufficient to
-	remove all the undo records */
-
-	if (trx_purge(1, std::min(srv_purge_batch_size, 20UL), true)) {
-		ut_a(srv_fast_shutdown);
-	}
+	} while (!srv_purge_should_exit(n_total_purged));
 
 	/* The task queue should always be empty, independent of fast
 	shutdown state. */

@@ -49,10 +49,9 @@ innobase_start_or_create_for_mysql(void);
 void
 innodb_shutdown();
 
-/****************************************************************//**
-Shuts down background threads that can generate undo pages. */
+/** Shut down background threads that can generate undo log. */
 void
-srv_shutdown_bg_undo_sources(void);
+srv_shutdown_bg_undo_sources();
 
 /*************************************************************//**
 Copy the file path component of the physical file to parameter. It will
@@ -137,6 +136,9 @@ enum srv_shutdown_t {
 				all file spaces and close all files */
 	SRV_SHUTDOWN_EXIT_THREADS/*!< Exit all threads */
 };
+
+/** Whether any undo log records can be generated */
+extern bool srv_undo_sources;
 
 /** At a shutdown this value climbs from SRV_SHUTDOWN_NONE to
 SRV_SHUTDOWN_CLEANUP and then to SRV_SHUTDOWN_LAST_PHASE, and so on */

@@ -149,19 +149,30 @@ UNIV_INTERN uint	srv_sys_space_size_debug;
 determine which threads need to be stopped if we need to abort during
 the initialisation step. */
 enum srv_start_state_t {
+	/** No thread started */
 	SRV_START_STATE_NONE = 0,		/*!< No thread started */
+	/** lock_wait_timeout_thread started */
 	SRV_START_STATE_LOCK_SYS = 1,		/*!< Started lock-timeout
 						thread. */
-	SRV_START_STATE_IO = 2,			/*!< Started IO threads */
-	SRV_START_STATE_MONITOR = 4,		/*!< Started montior thread */
-	SRV_START_STATE_MASTER = 8,		/*!< Started master threadd. */
-	SRV_START_STATE_PURGE = 16,		/*!< Started purge thread(s) */
-	SRV_START_STATE_STAT = 32		/*!< Started bufdump + dict stat
-						and FTS optimize thread. */
+	/** buf_flush_page_cleaner_coordinator,
+	buf_flush_page_cleaner_worker started */
+	SRV_START_STATE_IO = 2,
+	/** srv_error_monitor_thread, srv_monitor_thread started */
+	SRV_START_STATE_MONITOR = 4,
+	/** srv_master_thread started */
+	SRV_START_STATE_MASTER = 8,
+	/** srv_purge_coordinator_thread, srv_worker_thread started */
+	SRV_START_STATE_PURGE = 16,
+	/** fil_crypt_thread, btr_defragment_thread started
+	(all background threads that can generate redo log but not undo log */
+	SRV_START_STATE_REDO = 32
 };
 
 /** Track server thrd starting phases */
 static ulint	srv_start_state;
+
+/** Whether any undo log records can be generated */
+bool srv_undo_sources;
 
 /** At a shutdown this value climbs from SRV_SHUTDOWN_NONE to
 SRV_SHUTDOWN_CLEANUP and then to SRV_SHUTDOWN_LAST_PHASE, and so on */
@@ -185,8 +196,6 @@ static os_thread_t	buf_dump_thread_handle;
 static os_thread_t	dict_stats_thread_handle;
 /** Status variables, is thread started ?*/
 static bool		thread_started[SRV_MAX_N_IO_THREADS + 6 + 32] = {false};
-static bool		buf_dump_thread_started = false;
-static bool		dict_stats_thread_started = false;
 static bool		buf_flush_page_cleaner_thread_started = false;
 /** Name of srv_monitor_file */
 static char*	srv_monitor_file_name;
@@ -1225,10 +1234,6 @@ srv_shutdown_all_bg_threads()
 {
 	srv_shutdown_state = SRV_SHUTDOWN_EXIT_THREADS;
 
-	if (!srv_start_state) {
-		return;
-	}
-
 	/* All threads end up waiting for certain events. Put those events
 	to the signaled state. Then the threads will exit themselves after
 	os_event_wait(). */
@@ -1839,7 +1844,6 @@ innobase_start_or_create_for_mysql(void)
 	recv_sys_create();
 	recv_sys_init(buf_pool_get_curr_size());
 	lock_sys_create(srv_lock_table_size);
-	srv_start_state_set(SRV_START_STATE_LOCK_SYS);
 
 	/* Create i/o-handler threads: */
 
@@ -1854,6 +1858,8 @@ innobase_start_or_create_for_mysql(void)
 	if (!srv_read_only_mode) {
 		buf_flush_page_cleaner_init();
 
+		buf_page_cleaner_is_active = true;
+
 		os_thread_create(buf_flush_page_cleaner_coordinator,
 				 NULL, NULL);
 
@@ -1862,11 +1868,6 @@ innobase_start_or_create_for_mysql(void)
 		for (i = 1; i < srv_n_page_cleaners; ++i) {
 			os_thread_create(buf_flush_page_cleaner_worker,
 					 NULL, NULL);
-		}
-
-		/* Make sure page cleaner is active. */
-		while (!buf_page_cleaner_is_active) {
-			os_thread_sleep(10000);
 		}
 
 		srv_start_state_set(SRV_START_STATE_IO);
@@ -2561,7 +2562,8 @@ files_checked:
 			srv_monitor_thread,
 			NULL, thread_ids + 4 + SRV_MAX_N_IO_THREADS);
 		thread_started[4 + SRV_MAX_N_IO_THREADS] = true;
-		srv_start_state_set(SRV_START_STATE_MONITOR);
+		srv_start_state |= SRV_START_STATE_LOCK_SYS
+			| SRV_START_STATE_MONITOR;
 	}
 
 	/* Create the SYS_FOREIGN and SYS_FOREIGN_COLS system tables */
@@ -2611,6 +2613,15 @@ files_checked:
 			NULL, thread_ids + (1 + SRV_MAX_N_IO_THREADS));
 		thread_started[1 + SRV_MAX_N_IO_THREADS] = true;
 		srv_start_state_set(SRV_START_STATE_MASTER);
+
+		/* Create the dict stats gathering thread */
+		dict_stats_thread_handle = os_thread_create(
+			dict_stats_thread, NULL, NULL);
+		srv_dict_stats_thread_active = true;
+
+		/* Create the thread that will optimize the FTS sub-system. */
+		fts_optimize_init();
+		srv_undo_sources = true;
 	}
 
 	if (!srv_read_only_mode
@@ -2695,7 +2706,6 @@ files_checked:
 			os_thread_create(buf_dump_thread, NULL, NULL);
 
 		srv_buf_dump_thread_active = true;
-		buf_dump_thread_started = true;
 #ifdef WITH_WSREP
 		} else {
 			ib::warn() <<
@@ -2719,15 +2729,6 @@ files_checked:
 		*/
 		log_make_checkpoint_at(LSN_MAX, TRUE);
 
-		/* Create the dict stats gathering thread */
-		dict_stats_thread_handle = os_thread_create(
-			dict_stats_thread, NULL, NULL);
-		srv_dict_stats_thread_active = true;
-		dict_stats_thread_started = true;
-
-		/* Create the thread that will optimize the FTS sub-system. */
-		fts_optimize_init();
-
 		/* Init data for datafile scrub threads */
 		btr_scrub_init();
 
@@ -2736,7 +2737,7 @@ files_checked:
 		btr_defragment_thread_active = true;
 		os_thread_create(btr_defragment_thread, NULL, NULL);
 
-		srv_start_state_set(SRV_START_STATE_STAT);
+		srv_start_state |= SRV_START_STATE_REDO;
 	}
 
 	/* Create the buffer pool resize thread */
@@ -2776,16 +2777,19 @@ srv_fts_close(void)
 }
 #endif
 
-/****************************************************************//**
-Shuts down background threads that can generate undo pages. */
+/** Shut down background threads that can generate undo log. */
 void
-srv_shutdown_bg_undo_sources(void)
-/*===========================*/
+srv_shutdown_bg_undo_sources()
 {
-	if (srv_start_state_is_set(SRV_START_STATE_STAT)) {
+	if (srv_undo_sources) {
 		ut_ad(!srv_read_only_mode);
 		fts_optimize_shutdown();
 		dict_stats_shutdown();
+		while (row_get_background_drop_list_len_low()) {
+			srv_wake_master_thread();
+			os_thread_yield();
+		}
+		srv_undo_sources = false;
 	}
 }
 
@@ -2794,10 +2798,7 @@ void
 innodb_shutdown()
 {
 	ut_ad(!srv_running);
-
-	if (srv_fast_shutdown) {
-		srv_shutdown_bg_undo_sources();
-	}
+	ut_ad(!srv_undo_sources);
 
 	/* 1. Flush the buffer pool to disk, write the current lsn to
 	the tablespace header(s), and copy all log data to archive.
@@ -2850,7 +2851,7 @@ innodb_shutdown()
 		dict_stats_thread_deinit();
 	}
 
-	if (srv_start_state_is_set(SRV_START_STATE_STAT)) {
+	if (srv_start_state_is_set(SRV_START_STATE_REDO)) {
 		ut_ad(!srv_read_only_mode);
 		/* srv_shutdown_bg_undo_sources() already invoked
 		fts_optimize_shutdown(); dict_stats_shutdown(); */
@@ -2923,10 +2924,6 @@ innodb_shutdown()
 		buf_pool_free(srv_buf_pool_instances);
 	}
 
-	/* 6. Free the thread management resoruces. */
-	os_thread_free();
-
-	/* 7. Free the synchronisation infrastructure. */
 	sync_check_close();
 
 	if (dict_foreign_err_file) {
